@@ -17,7 +17,6 @@ from vllm_gaudi.extension.defragmentation import OnlineDefragmenter
 from vllm_gaudi.extension.profiler import (HabanaMemoryProfiler, format_bytes, setup_profiler)
 from vllm_gaudi.extension.runtime import get_config
 
-import vllm.envs as envs
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import (ensure_model_parallel_initialized, init_distributed_environment)
 from vllm.distributed.kv_transfer import (
@@ -27,7 +26,7 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, set_random_seed)
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec)
+from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.utils import is_fake_hpu
@@ -96,8 +95,10 @@ class HPUWorker(WorkerBase):
 
     def init_profiler(self):
         """Initialize the profiler."""
-        if envs.VLLM_TORCH_PROFILER_DIR:
-            torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
+        torch_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
+        if torch_profiler_dir:
+            logger.warning("VLLM_TORCH_PROFILER_DIR is deprecated!")
+            torch_profiler_trace_dir = torch_profiler_dir
             logger.info("Profiling enabled. Traces will be saved to: %s", torch_profiler_trace_dir)
             if os.getenv('VLLM_PROFILER_ENABLED') == 'full':
                 fn = self.model_runner.profiler.full_trace_handler
@@ -213,6 +214,20 @@ class HPUWorker(WorkerBase):
 
                 single_kv_block_size_bytes += layer_spec.page_size_bytes
 
+            elif isinstance(layer_spec, MambaSpec):
+                dtype0 = layer_spec.dtypes[0]
+                dtype1 = layer_spec.dtypes[1]
+
+                # Use an empty tensor instead of `None`` to force Dynamo to pass
+                # it by reference, rather by specializing on the value ``None``.
+                hpu_ssm_cache = torch.tensor([], dtype=dtype0, device='hpu')
+                hpu_conv_cache = torch.tensor([], dtype=dtype1, device='hpu')
+                hpu_ssm_scales = torch.tensor([], dtype=dtype0, device='hpu')
+                hpu_conv_scales = torch.tensor([], dtype=dtype1, device='hpu')
+
+                kv_caches[layer_name] = (hpu_ssm_cache, hpu_conv_cache, hpu_ssm_scales, hpu_conv_scales)
+
+                single_kv_block_size_bytes += layer_spec.page_size_bytes
             else:
                 raise NotImplementedError
 
@@ -230,7 +245,7 @@ class HPUWorker(WorkerBase):
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
             return fake_hpu_cache_alloc
         with HabanaMemoryProfiler() as m:
-            self.model_runner.profile_run()
+            self.model_runner.profile_run(initialize_only=True)
             torch.hpu.synchronize()
         msg = ("Model profiling run "
                f"took {m.get_summary_string()}")

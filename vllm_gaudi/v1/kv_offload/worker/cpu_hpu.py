@@ -167,7 +167,6 @@ def swap_blocks_cpu_to_hpu(
     
     torch.hpu.synchronize()
 
-
 def swap_blocks(
     src_kv_caches: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     dst_kv_caches: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],

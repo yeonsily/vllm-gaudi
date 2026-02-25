@@ -15,6 +15,34 @@ from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.utils import has_quant_config
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
 
+from vllm.model_executor.layers.quantization.kernels import scaled_mm
+from vllm.platforms import PlatformEnum
+from vllm.model_executor.layers.quantization.kernels.scaled_mm.pytorch import (
+    PerTensorTorchFP8ScaledMMLinearKernel,
+    ChannelWiseTorchFP8ScaledMMLinearKernel,
+)
+
+
+class HPUPerTensorTorchFP8ScaledMMLinearKernel(PerTensorTorchFP8ScaledMMLinearKernel):
+
+    @classmethod
+    def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
+        return True, None
+
+
+class HPUChannelWiseTorchFP8ScaledMMLinearKernel(ChannelWiseTorchFP8ScaledMMLinearKernel):
+
+    @classmethod
+    def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
+        return True, None
+
+
+if PlatformEnum.OOT not in scaled_mm._POSSIBLE_FP8_KERNELS:
+    scaled_mm._POSSIBLE_FP8_KERNELS[PlatformEnum.OOT] = [
+        HPUPerTensorTorchFP8ScaledMMLinearKernel,
+        HPUChannelWiseTorchFP8ScaledMMLinearKernel,
+    ]
+
 
 class Fp8LinearMethod(OrigFp8LinearMethod):
 
@@ -148,6 +176,11 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         if self.block_quant:
             layer = hpu_ops.fp8_block_moe_prepare_weights(layer, envs.VLLM_HPU_FORCE_CHANNEL_FP8)
         else:
+            if self.quant_config.activation_scheme == "static":
+                if (layer.w13_input_scale is None or layer.w2_input_scale is None):
+                    raise ValueError("QuantConfig has static quantization, but found "
+                                     "activation scales are None.")
+                layer.w13_input_scale = torch.nn.Parameter(layer.w13_input_scale.max(), requires_grad=False)
             layer = hpu_ops.fp8_channel_moe_prepare_weights(layer)
 
     def apply_monolithic(
