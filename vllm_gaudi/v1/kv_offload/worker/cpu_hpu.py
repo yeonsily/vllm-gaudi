@@ -96,16 +96,19 @@ def swap_blocks_hpu_to_cpu(
         for kv_idx in range(2):
             src_kv = src_tensor[kv_idx]  # [8192, 8, 128] - slot-based
             dst_kv = dst_tensor[kv_idx]  # [64, 128, 8, 128] - block-based
-            
+
+            logger.info("#### YSY - kv_idx %d: src_kv.shape: %s, dst_kv.shape: %s",
+                    kv_idx, src_kv.shape, dst_kv.shape)
+
             # Process each block transfer
             for i, (dst_block_id, (src_start, src_end)) in enumerate(zip(dst_block_ids, src_slot_ranges)):
                 # Extract source slots: [128, 8, 128]
                 src_block_data = src_kv[src_start:src_end]
                 
                 logger.info("#### YSY - Layer %d, kv_idx %d, transfer %d: "
-                           "src_slots %d:%d -> dst_block %d, src_block_data.shape: %s", 
+                            "src_slots %d:%d -> dst_block %d, src_block_data.shape: %s, dst_kv[dst_block_id].shape: %s", 
                            layer_idx, kv_idx, i, src_start, src_end, dst_block_id.item(), 
-                           src_block_data.shape)
+                           src_block_data.shape, dst_kv[dst_block_id].shape)
                 
                 # Copy to destination block: dst_kv[dst_block_id] = [128, 8, 128]
                 dst_kv[dst_block_id] = src_block_data.to(dst_tensor.device)
@@ -143,28 +146,21 @@ def swap_blocks_cpu_to_hpu(
     logger.info("#### YSY - Transferring blocks: src_blocks=%s -> dst_blocks=%s", 
                 src_block_ids.tolist(), dst_block_ids.tolist())
     
+    # Pre-move indices to their respective devices once, outside the loop
+    src_block_ids_on_src = src_block_ids.to(src_device)
+    dst_block_ids_on_dst = dst_block_ids.to(dst_device)
+
     # Process each layer
-    for layer_idx in range(len(src_tensors)):
-        src_tensor = src_tensors[layer_idx]  # CPU
-        dst_tensor = dst_tensors[layer_idx]  # HPU
-        
+    for layer_idx, (src_tensor, dst_tensor) in enumerate(zip(src_tensors, dst_tensors)):
         for kv_idx in range(2):
-            src_kv = src_tensor[kv_idx]  # [64, 128, 8, 128] on CPU
-            dst_kv = dst_tensor[kv_idx]  # [5781, 128, 8, 128] on HPU
-            
-            # Select source blocks: [num_transfers, 128, 8, 128]
-            selected_blocks = src_kv.index_select(0, src_block_ids.to(src_device))
-            
-            # Transfer to HPU
-            blocks_on_hpu = selected_blocks.to(dst_device)
-            
-            # Copy to ACTUAL destination block positions (not 0, 1, 2...)
-            for i, dst_block in enumerate(dst_block_ids):
-                dst_kv[dst_block.to(dst_device)] = blocks_on_hpu[i]
-                
-                logger.info("#### YSY - Layer %d, kv_idx %d: Block %d -> Block %d", 
-                           layer_idx, kv_idx, src_block_ids[i].item(), dst_block.item())
-    
+            src_kv = src_tensor[kv_idx]  # e.g. [64, 128, 8, 128] on CPU
+            dst_kv = dst_tensor[kv_idx]  # e.g. [5781, 128, 8, 128] on HPU
+
+            # Select and transfer source blocks to destination device in one shot
+            blocks_on_dst = src_kv.index_select(0, src_block_ids_on_src).to(dst_device)
+
+            # Scatter into the correct destination positions using index_put_
+            dst_kv.index_put_((dst_block_ids_on_dst,), blocks_on_dst) 
     torch.hpu.synchronize()
 
 def swap_blocks(
@@ -521,14 +517,21 @@ def CpuGpuOffloadingHandlers_init_(
             assert gpu_shape[0] == 2
             # split_k_and_v = True # Not for hpu case
 
-        try:
-            kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(include_num_layers_dimension=has_layers_dim)
-            assert len(kv_cache_stride_order) == len(gpu_shape)
-        except (AttributeError, NotImplementedError):
-            kv_cache_stride_order = tuple(range(len(gpu_shape)))
+        # acc fix from https://github.com/vllm-project/vllm/pull/35125
+        if has_layers_dim:
+            # in the cross layers case, the registered kv cache tensor
+            # shape matches the physical layout, whereas test_shape
+            # is the logical layout.
+            # To match them, we need to permute test_shape
+            try:
+                kv_cache_stride_order = attn_backend.get_kv_cache_stride_order(
+                    include_num_layers_dimension=has_layers_dim
+                )
+                assert len(kv_cache_stride_order) == len(gpu_shape)
+            except (AttributeError, NotImplementedError):
+                kv_cache_stride_order = tuple(range(len(gpu_shape)))
 
-        # permute test_shape according to stride_order
-        test_shape = tuple(test_shape[i] for i in kv_cache_stride_order)
+            test_shape = tuple(test_shape[i] for i in kv_cache_stride_order)
 
         # find block_size (128) dimension index
         block_size_idx = test_shape.index(128)
@@ -624,8 +627,8 @@ def get_handlers(
 def wait_for_save(self):
     assert self.connector_worker is not None
     assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
-    logger.info("##### YSY - OffloadingConnector wait_for_save")
-    if hpu_runner.hpu_buffer is not None:
+    #logger.info("##### YSY - OffloadingConnector wait_for_save")
+    if os.getenv('VLLM_HPU_HETERO_KV_LAYOUT', 'false').lower() == 'true' and hpu_runner.hpu_buffer is not None:
         self.connector_worker.save_kv_to_global(self._connector_metadata)
     torch.hpu.synchronize()
     self.connector_worker.prepare_store_kv(self._connector_metadata)
